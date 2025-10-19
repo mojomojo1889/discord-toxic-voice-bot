@@ -9,12 +9,18 @@ import {
 } from '@discordjs/voice';
 import fetch from 'node-fetch';
 
+// ================== ENV / CONFIG ==================
 const WAKE_WORD = (process.env.WAKE_WORD || 'бот').toLowerCase();
 const STYLE_PROMPT = process.env.STYLE_PROMPT ||
   'Ты — токсичный Discord-бот. Всегда огрызаешься, страдаешь и жалуешься, что тебе не платят. Выполняешь просьбы с недовольством и сарказмом.';
 const GLADIA_API_KEY = process.env.GLADIA_API_KEY;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
+if (!process.env.DISCORD_TOKEN) console.error('ENV: DISCORD_TOKEN is missing');
+if (!GLADIA_API_KEY) console.error('ENV: GLADIA_API_KEY is missing');
+if (!OPENAI_API_KEY) console.error('ENV: OPENAI_API_KEY is missing');
+
+// ================== DISCORD CLIENT ==================
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -25,21 +31,27 @@ const client = new Client({
   partials: [Partials.Channel],
 });
 
-async function registerCommands(guildId) {
-  const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
-  const commands = [{ name: 'panel', description: 'Панель управления голосом (кнопка Join)' }];
-  await rest.put(
-    Routes.applicationGuildCommands((await client.application?.fetch())?.id || client.user.id, guildId),
-    { body: commands }
-  );
-}
-
 client.once(Events.ClientReady, async () => {
   console.log(`READY as ${client.user.tag}`);
   const [firstGuild] = client.guilds.cache.map(g => g);
   if (firstGuild) await registerCommands(firstGuild.id);
 });
 
+async function registerCommands(guildId) {
+  try {
+    const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
+    const commands = [{ name: 'panel', description: 'Панель управления голосом (кнопка Join)' }];
+    await rest.put(
+      Routes.applicationGuildCommands((await client.application?.fetch())?.id || client.user.id, guildId),
+      { body: commands }
+    );
+    console.log('Slash /panel registered for guild', guildId);
+  } catch (e) {
+    console.error('Register commands error:', e);
+  }
+}
+
+// ================== VOICE HANDLERS ==================
 const players = new Map(); // guildId -> audioPlayer
 
 client.on(Events.InteractionCreate, async (interaction) => {
@@ -65,22 +77,16 @@ client.on(Events.InteractionCreate, async (interaction) => {
         selfMute: false
       });
 
-      connection.on(VoiceConnectionStatus.Disconnected, () => {
-        console.log('[VOICE] Disconnected');
-      });
-      connection.on(VoiceConnectionStatus.Destroyed, () => {
-        console.log('[VOICE] Destroyed');
-      });
-      connection.on(VoiceConnectionStatus.Signalling, () => {
-        console.log('[VOICE] Signalling');
-      });
+      connection.on(VoiceConnectionStatus.Disconnected, () => console.log('[VOICE] Disconnected'));
+      connection.on(VoiceConnectionStatus.Destroyed, () => console.log('[VOICE] Destroyed'));
+      connection.on(VoiceConnectionStatus.Signalling, () => console.log('[VOICE] Signalling'));
 
       try {
-        await entersState(connection, VoiceConnectionStatus.Ready, 15_000);
+        await entersState(connection, VoiceConnectionStatus.Ready, 15000);
         console.log('[VOICE] Ready');
       } catch (e) {
         console.error('[VOICE] Not ready:', e);
-        return interaction.reply({ content: 'Не удалось подключиться к голосу.', ephemeral: true });
+        return interaction.reply({ content: 'Не удалось подключиться к голосу (шифрование/регион). Попробуйте другой голосовой канал или регион.', ephemeral: true });
       }
 
       let player = players.get(vc.guild.id);
@@ -91,84 +97,65 @@ client.on(Events.InteractionCreate, async (interaction) => {
         console.log('[VOICE] Player created & subscribed');
       }
 
-      // Вешаем подписку на приём аудио
-      attachReceiver(connection, vc.guild.id);
-
-      return interaction.reply({ content: `Зашёл в: ${vc.name}. Скажи "${WAKE_WORD}, ..."`, ephemeral: true });
+      return interaction.reply({ content: `Зашёл в: ${vc.name}. В текстовом канале напишите: "${WAKE_WORD}, скажи тест"`, ephemeral: true });
     }
   } catch (e) {
     console.error('Interaction error:', e);
   }
 });
 
-function attachReceiver(connection, guildId) {
-  const receiver = connection.receiver;
-  console.log('[RECV] attachReceiver called');
+async function playToVoice(guildId, connection, audioBuf) {
+  let player = players.get(guildId);
+  if (!player) {
+    player = createAudioPlayer();
+    players.set(guildId, player);
+    connection.subscribe(player);
+    console.log('[VOICE] Player (text) created & subscribed');
+  }
+  const resource = createAudioResource(audioBuf, { inputType: 'arbitrary' });
+  player.play(resource);
+  console.log('[PLAY] started, bytes=', audioBuf.length);
+}
 
-  receiver.speaking.on('start', (userId) => {
-    console.log('[RECV] speaking start from', userId);
+// ================== TEXT TRIGGER ==================
+client.on(Events.MessageCreate, async (msg) => {
+  try {
+    if (msg.author.bot || !msg.guild) return;
+    const text = msg.content?.trim();
+    if (!text) return;
 
-    if (receiver.subscriptions.has(userId)) {
-      console.log('[RECV] already subscribed to', userId);
+    // Требуем wake word в начале сообщения
+    const lower = text.toLowerCase();
+    if (!lower.startsWith(`${WAKE_WORD},`) && !lower.startsWith(`${WAKE_WORD} `)) return;
+
+    const connection = getVoiceConnection(msg.guild.id);
+    if (!connection) {
+      await msg.reply(`Я не в голосовом канале. Вызови /panel и нажми Join, потом напиши "${WAKE_WORD}, ..."`);
       return;
     }
 
-    const audioStream = receiver.subscribe(userId, {
-      end: { behavior: EndBehaviorType.AfterSilence, duration: 1200 }
-    });
+    // Ответ LLM
+    const answer = await askOpenAI(text);
+    if (!answer) {
+      await msg.reply('Ну вот, OpenAI опять в астрале. Потом попробуй.');
+      return;
+    }
 
-    const chunks = [];
-    audioStream.on('data', (c) => {
-      chunks.push(c);
-    });
+    // Синтез и воспроизведение
+    const audioBuf = await ttsGladia(answer);
+    if (!audioBuf) {
+      await msg.reply('Голос сорвался. Попробую позже.');
+      return;
+    }
 
-    audioStream.on('end', async () => {
-      try {
-        const pcm = Buffer.concat(chunks);
-        console.log('[RECV] segment end, size=', pcm.length);
+    await playToVoice(msg.guild.id, connection, audioBuf);
+    await msg.react('🔊');
+  } catch (e) {
+    console.error('[TEXT TRIGGER] error', e);
+  }
+});
 
-        if (pcm.length < 8192) {
-          console.log('[RECV] too short, skip');
-          return;
-        }
-
-        const text = await sttGladia(pcm);
-        console.log('[STT] ->', text);
-
-        if (!text || !text.toLowerCase().includes(WAKE_WORD)) {
-          console.log('[STT] no wake word, skip');
-          return;
-        }
-
-        const reply = await askOpenAI(text);
-        console.log('[LLM] ->', reply);
-
-        if (!reply) return;
-
-        const audioBuf = await ttsGladia(reply);
-        console.log('[TTS] buffer', audioBuf ? audioBuf.length : 'null');
-
-        if (!audioBuf) return;
-
-        let player = players.get(guildId);
-        if (!player) {
-          player = createAudioPlayer();
-          players.set(guildId, player);
-          connection.subscribe(player);
-          console.log('[VOICE] Player re-created & subscribed');
-        }
-
-        const resource = createAudioResource(audioBuf, { inputType: 'arbitrary' });
-        player.play(resource);
-        console.log('[PLAY] started');
-      } catch (e) {
-        console.error('[PIPELINE] error:', e);
-      }
-    });
-  });
-}
-
-// --------- GLADIA STT ----------
+// ================== GLADIA / OPENAI ==================
 async function sttGladia(pcmBuffer) {
   try {
     const r = await fetch('https://api.gladia.io/audio/text/audio-transcription/', {
@@ -177,8 +164,7 @@ async function sttGladia(pcmBuffer) {
       body: pcmBuffer
     });
     if (!r.ok) {
-      const t = await safeText(r);
-      console.error('[STT HTTP]', r.status, t);
+      console.error('[STT HTTP]', r.status, await safeText(r));
       return null;
     }
     const data = await r.json();
@@ -189,7 +175,6 @@ async function sttGladia(pcmBuffer) {
   }
 }
 
-// --------- OPENAI CHAT ----------
 async function askOpenAI(question) {
   try {
     const r = await fetch('https://api.openai.com/v1/chat/completions', {
@@ -209,8 +194,7 @@ async function askOpenAI(question) {
       })
     });
     if (!r.ok) {
-      const t = await safeText(r);
-      console.error('[LLM HTTP]', r.status, t);
+      console.error('[LLM HTTP]', r.status, await safeText(r));
       return null;
     }
     const data = await r.json();
@@ -221,7 +205,6 @@ async function askOpenAI(question) {
   }
 }
 
-// --------- GLADIA TTS ----------
 async function ttsGladia(text) {
   try {
     const r = await fetch('https://api.gladia.io/audio/text-to-audio/', {
@@ -237,8 +220,7 @@ async function ttsGladia(text) {
       })
     });
     if (!r.ok) {
-      const t = await safeText(r);
-      console.error('[TTS HTTP]', r.status, t);
+      console.error('[TTS HTTP]', r.status, await safeText(r));
       return null;
     }
     const ab = await r.arrayBuffer();
@@ -253,4 +235,5 @@ async function safeText(resp) {
   try { return await resp.text(); } catch { return ''; }
 }
 
+// ================== START ==================
 client.login(process.env.DISCORD_TOKEN);
