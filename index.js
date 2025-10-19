@@ -35,144 +35,168 @@ async function registerCommands(guildId) {
 }
 
 client.once(Events.ClientReady, async () => {
-  console.log(`Logged in as ${client.user.tag}`);
+  console.log(`READY as ${client.user.tag}`);
   const [firstGuild] = client.guilds.cache.map(g => g);
   if (firstGuild) await registerCommands(firstGuild.id);
 });
 
-// Глобальный плеер на соединение — чтобы переиспользовать
 const players = new Map(); // guildId -> audioPlayer
 
 client.on(Events.InteractionCreate, async (interaction) => {
-  if (interaction.isButton() && interaction.customId === 'join_voice') {
-    const vc = interaction.member?.voice?.channel;
-    if (!vc) return interaction.reply({ content: 'Зайдите в голосовой канал.', ephemeral: true });
-
-    const connection = joinVoiceChannel({
-      channelId: vc.id,
-      guildId: vc.guild.id,
-      adapterCreator: vc.guild.voiceAdapterCreator,
-      selfDeaf: false,
-      selfMute: false
-    });
-
-    // Ждём готовности соединения
-    try {
-      await entersState(connection, VoiceConnectionStatus.Ready, 10_000);
-    } catch {
-      return interaction.reply({ content: 'Не удалось подключиться к голосовому каналу.', ephemeral: true });
+  try {
+    if (interaction.isChatInputCommand() && interaction.commandName === 'panel') {
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('join_voice').setLabel('Join voice').setStyle(ButtonStyle.Success)
+      );
+      return interaction.reply({ content: 'Управление голосом', components: [row], ephemeral: true });
     }
 
-    // Подготовим плеер
-    let player = players.get(vc.guild.id);
-    if (!player) {
-      player = createAudioPlayer();
-      players.set(vc.guild.id, player);
-      connection.subscribe(player);
+    if (interaction.isButton() && interaction.customId === 'join_voice') {
+      const vc = interaction.member?.voice?.channel;
+      if (!vc) return interaction.reply({ content: 'Зайдите в голосовой канал.', ephemeral: true });
+
+      console.log('[VOICE] Trying to join', vc.id, vc.name);
+
+      const connection = joinVoiceChannel({
+        channelId: vc.id,
+        guildId: vc.guild.id,
+        adapterCreator: vc.guild.voiceAdapterCreator,
+        selfDeaf: false,
+        selfMute: false
+      });
+
+      connection.on(VoiceConnectionStatus.Disconnected, () => {
+        console.log('[VOICE] Disconnected');
+      });
+      connection.on(VoiceConnectionStatus.Destroyed, () => {
+        console.log('[VOICE] Destroyed');
+      });
+      connection.on(VoiceConnectionStatus.Signalling, () => {
+        console.log('[VOICE] Signalling');
+      });
+
+      try {
+        await entersState(connection, VoiceConnectionStatus.Ready, 15_000);
+        console.log('[VOICE] Ready');
+      } catch (e) {
+        console.error('[VOICE] Not ready:', e);
+        return interaction.reply({ content: 'Не удалось подключиться к голосу.', ephemeral: true });
+      }
+
+      let player = players.get(vc.guild.id);
+      if (!player) {
+        player = createAudioPlayer();
+        players.set(vc.guild.id, player);
+        connection.subscribe(player);
+        console.log('[VOICE] Player created & subscribed');
+      }
+
+      // Вешаем подписку на приём аудио
+      attachReceiver(connection, vc.guild.id);
+
+      return interaction.reply({ content: `Зашёл в: ${vc.name}. Скажи "${WAKE_WORD}, ..."`, ephemeral: true });
     }
-
-    // Подписка на входящий звук
-    attachReceiver(connection, vc.guild.id);
-
-    return interaction.reply({ content: `Зашёл в: ${vc.name}. Скажи "${WAKE_WORD}, ..." чтобы обратиться.`, ephemeral: true });
-  }
-
-  if (interaction.isChatInputCommand() && interaction.commandName === 'panel') {
-    const row = new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('join_voice').setLabel('Join voice').setStyle(ButtonStyle.Success)
-    );
-    return interaction.reply({ content: 'Управление голосом', components: [row], ephemeral: true });
+  } catch (e) {
+    console.error('Interaction error:', e);
   }
 });
 
-// Подписка на входящий голосовой поток
 function attachReceiver(connection, guildId) {
   const receiver = connection.receiver;
+  console.log('[RECV] attachReceiver called');
 
-  // Событие speaking — когда кто-то начинает говорить
   receiver.speaking.on('start', (userId) => {
-    try {
-      // Уже подписаны на этого пользователя?
-      if (receiver.subscriptions.has(userId)) return;
+    console.log('[RECV] speaking start from', userId);
 
-      // Подписываемся на поток пользователя
-      const audioStream = receiver.subscribe(userId, {
-        end: { behavior: EndBehaviorType.AfterSilence, duration: 1200 } // 1.2 сек тишины = конец фразы
-      });
+    if (receiver.subscriptions.has(userId)) {
+      console.log('[RECV] already subscribed to', userId);
+      return;
+    }
 
-      const chunks = [];
-      audioStream.on('data', (c) => chunks.push(c));
-      audioStream.on('end', async () => {
+    const audioStream = receiver.subscribe(userId, {
+      end: { behavior: EndBehaviorType.AfterSilence, duration: 1200 }
+    });
+
+    const chunks = [];
+    audioStream.on('data', (c) => {
+      chunks.push(c);
+    });
+
+    audioStream.on('end', async () => {
+      try {
         const pcm = Buffer.concat(chunks);
-        if (pcm.length < 6400) return; // слишком коротко
+        console.log('[RECV] segment end, size=', pcm.length);
 
-        // Отправляем на STT
+        if (pcm.length < 8192) {
+          console.log('[RECV] too short, skip');
+          return;
+        }
+
         const text = await sttGladia(pcm);
-        if (!text) return;
+        console.log('[STT] ->', text);
 
-        console.log('STT:', text);
+        if (!text || !text.toLowerCase().includes(WAKE_WORD)) {
+          console.log('[STT] no wake word, skip');
+          return;
+        }
 
-        // Проверяем wake word
-        if (!text.toLowerCase().includes(WAKE_WORD)) return;
-
-        // Диалог
         const reply = await askOpenAI(text);
+        console.log('[LLM] ->', reply);
+
         if (!reply) return;
 
-        console.log('LLM:', reply);
-
-        // TTS
         const audioBuf = await ttsGladia(reply);
+        console.log('[TTS] buffer', audioBuf ? audioBuf.length : 'null');
+
         if (!audioBuf) return;
 
-        // Воспроизводим
         let player = players.get(guildId);
         if (!player) {
           player = createAudioPlayer();
           players.set(guildId, player);
           connection.subscribe(player);
+          console.log('[VOICE] Player re-created & subscribed');
         }
+
         const resource = createAudioResource(audioBuf, { inputType: 'arbitrary' });
         player.play(resource);
-      });
-    } catch (e) {
-      console.error('Receiver error:', e);
-    }
+        console.log('[PLAY] started');
+      } catch (e) {
+        console.error('[PIPELINE] error:', e);
+      }
+    });
   });
 }
 
-// ========== GLADIA STT ==========
+// --------- GLADIA STT ----------
 async function sttGladia(pcmBuffer) {
   try {
-    // Gladia принимает файлы; отправим как octet-stream
-    const resp = await fetch('https://api.gladia.io/audio/text/audio-transcription/', {
+    const r = await fetch('https://api.gladia.io/audio/text/audio-transcription/', {
       method: 'POST',
-      headers: {
-        'x-gladia-key': GLADIA_API_KEY,
-        // Без Content-Type, Gladia сам определит по сырым данным или можно multipart/form-data
-      },
+      headers: { 'x-gladia-key': GLADIA_API_KEY },
       body: pcmBuffer
     });
-    if (!resp.ok) {
-      console.error('STT HTTP', resp.status, await safeText(resp));
+    if (!r.ok) {
+      const t = await safeText(r);
+      console.error('[STT HTTP]', r.status, t);
       return null;
     }
-    const data = await resp.json();
+    const data = await r.json();
     return data.prediction || '';
-  } catch (err) {
-    console.error('STT error:', err);
+  } catch (e) {
+    console.error('[STT] error', e);
     return null;
   }
 }
 
-// ========== OPENAI CHAT ==========
+// --------- OPENAI CHAT ----------
 async function askOpenAI(question) {
   try {
-    const resp = await fetch('https://api.openai.com/v1/chat/completions', {
+    const r = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${OPENAI_API_KEY}`,
-        'Content-Type': 'application/json',
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        'Content-Type': 'application/json'
       },
       body: JSON.stringify({
         model: 'gpt-3.5-turbo',
@@ -184,22 +208,23 @@ async function askOpenAI(question) {
         max_tokens: 180
       })
     });
-    if (!resp.ok) {
-      console.error('OpenAI HTTP', resp.status, await safeText(resp));
+    if (!r.ok) {
+      const t = await safeText(r);
+      console.error('[LLM HTTP]', r.status, t);
       return null;
     }
-    const data = await resp.json();
+    const data = await r.json();
     return data.choices?.[0]?.message?.content || '';
-  } catch (err) {
-    console.error('OpenAI error:', err);
+  } catch (e) {
+    console.error('[LLM] error', e);
     return null;
   }
 }
 
-// ========== GLADIA TTS ==========
+// --------- GLADIA TTS ----------
 async function ttsGladia(text) {
   try {
-    const resp = await fetch('https://api.gladia.io/audio/text-to-audio/', {
+    const r = await fetch('https://api.gladia.io/audio/text-to-audio/', {
       method: 'POST',
       headers: {
         'x-gladia-key': GLADIA_API_KEY,
@@ -211,14 +236,15 @@ async function ttsGladia(text) {
         speaker: 'female-neutral'
       })
     });
-    if (!resp.ok) {
-      console.error('TTS HTTP', resp.status, await safeText(resp));
+    if (!r.ok) {
+      const t = await safeText(r);
+      console.error('[TTS HTTP]', r.status, t);
       return null;
     }
-    const ab = await resp.arrayBuffer();
+    const ab = await r.arrayBuffer();
     return Buffer.from(ab);
-  } catch (err) {
-    console.error('TTS error:', err);
+  } catch (e) {
+    console.error('[TTS] error', e);
     return null;
   }
 }
