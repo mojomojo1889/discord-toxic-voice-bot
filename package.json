@@ -1,0 +1,16 @@
+{
+  "name": "discord-toxic-voice-bot",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.11.0",
+    "dotenv": "^16.0.3",
+    "@discordjs/voice": "^0.15.0",
+    "node-fetch": "^3.3.2"
+  }
+}
